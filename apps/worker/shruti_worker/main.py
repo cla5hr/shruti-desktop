@@ -10,15 +10,21 @@ import threading
 import time
 import traceback
 
+from sqlalchemy import select
+
 from shruti_core import jobs
 from shruti_core.db import new_session
-from shruti_core.models import Job, Meeting
+from shruti_core.models import Job, Meeting, Transcript
 from shruti_core.settings import get_settings
 from shruti_worker.handlers import HANDLERS
 
 log = logging.getLogger("shruti.worker")
 
 STALL_SWEEP_INTERVAL_S = 60
+
+
+class JobCancelled(Exception):
+    """Raised inside a handler when the user hit Stop — unwinds without failing."""
 
 
 class _Heartbeat(threading.Thread):
@@ -50,6 +56,21 @@ def _mark_meeting_failed_if_terminal(session, job: Job) -> None:
             session.commit()
 
 
+def _settle_meeting_after_cancel(session, job: Job) -> None:
+    """A cancelled job leaves its meeting usable: 'ready' when a transcript exists
+    (e.g. a stopped re-run), 'failed' when there's nothing to show yet."""
+    if job.meeting_id is None:
+        return
+    meeting = session.get(Meeting, job.meeting_id)
+    if meeting is None or meeting.status != "processing":
+        return
+    has_transcript = session.scalars(
+        select(Transcript.id).where(Transcript.meeting_id == meeting.id, Transcript.is_active)
+    ).first()
+    meeting.status = "ready" if has_transcript else "failed"
+    session.commit()
+
+
 def run_one(session, job: Job) -> None:
     handler = HANDLERS.get(job.type)
     if handler is None:
@@ -59,6 +80,11 @@ def run_one(session, job: Job) -> None:
 
     def report_progress(progress: dict) -> None:
         jobs.heartbeat(session, job.id, progress=progress)
+        # cooperative Stop: the cancel endpoint flips the row to 'cancelled'; every
+        # progress checkpoint (each transcribed segment, each minutes chunk) notices
+        session.refresh(job)
+        if job.status == "cancelled":
+            raise JobCancelled
 
     hb = _Heartbeat(job.id, get_settings().worker_heartbeat_seconds)
     hb.start()
@@ -66,6 +92,10 @@ def run_one(session, job: Job) -> None:
         handler(session, job, report_progress)
         jobs.complete(session, job)
         log.info("job %s (%s) succeeded", job.id, job.type)
+    except JobCancelled:
+        session.rollback()
+        log.info("job %s (%s) cancelled by user", job.id, job.type)
+        _settle_meeting_after_cancel(session, job)
     except Exception:
         err = traceback.format_exc()
         log.error("job %s (%s) failed:\n%s", job.id, job.type, err)

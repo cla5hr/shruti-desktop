@@ -90,13 +90,29 @@ export default function SummaryPane({ meetingId }: { meetingId: string }) {
             </option>
           ))}
         </select>
-        <button
-          className="barbtn"
-          disabled={generating || regenerate.isPending}
-          onClick={() => regenerate.mutate()}
-        >
-          {summary ? "Regenerate" : "Generate"}
-        </button>
+        {generating ? (
+          <button
+            className="barbtn"
+            title="Stop generating minutes"
+            onClick={async () => {
+              const j = summarizeJobs.find(
+                (x) => x.status === "running" || x.status === "queued",
+              );
+              if (j) await api.cancelJob(j.id);
+              queryClient.invalidateQueries({ queryKey: ["jobs", meetingId] });
+            }}
+          >
+            ✕ Stop
+          </button>
+        ) : (
+          <button
+            className="barbtn"
+            disabled={regenerate.isPending}
+            onClick={() => regenerate.mutate()}
+          >
+            {summary ? "Regenerate" : "Generate"}
+          </button>
+        )}
         {summary && !editing && (
           <>
             <button

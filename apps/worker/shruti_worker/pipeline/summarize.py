@@ -208,6 +208,9 @@ def handle_summarize(session: Session, job: Job, report_progress: ProgressFn) ->
         report_progress({"stage": "minutes", "mode": "skipped_low_content", "words": word_count})
     else:
         content = generate_minutes(template_key, meeting.title, text, report_progress)
+        # checkpoint: a Stop pressed while the LLM was generating lands here, BEFORE
+        # the old minutes get replaced (report_progress raises JobCancelled)
+        report_progress({"stage": "persisting"})
         known = set(names.values()) | {seg.speaker_label for seg in segments if seg.speaker_label}
         content = clean_minutes(content, known)
         if len(content) < 20:

@@ -15,6 +15,10 @@ export default function SettingsPage() {
   const [download, setDownload] = useState<{ pct: number; mb: number; total: number } | null>(
     null,
   );
+  const [test, setTest] = useState<{ state: "idle" | "testing" | "ok" | "fail"; msg: string }>({
+    state: "idle",
+    msg: "",
+  });
 
   useEffect(() => {
     if (data && form === null) setForm({ ...data.values });
@@ -44,6 +48,19 @@ export default function SettingsPage() {
       setForm({ ...form, llm_mode: "live", llm_base_url: "http://localhost:11434/v1" });
     else setForm({ ...form, llm_mode: "live", llm_base_url: "" });
     setStatus("idle");
+    setTest({ state: "idle", msg: "" });
+  };
+
+  const testConnection = async () => {
+    setTest({ state: "testing", msg: "" });
+    try {
+      const base =
+        provider === "ollama" ? "http://localhost:11434/v1" : form.llm_base_url;
+      const r = await api.testLlm(base, form.llm_model, form.llm_api_key);
+      setTest({ state: r.ok ? "ok" : "fail", msg: r.detail });
+    } catch (e) {
+      setTest({ state: "fail", msg: e instanceof Error ? e.message : "test failed" });
+    }
   };
 
   const save = async () => {
@@ -208,14 +225,20 @@ export default function SettingsPage() {
                 the secret they give you. Self-hosted servers often need no key.
               </p>
               <label className="settings__row">
-                <span className="settings__label">Base URL</span>
+                <span className="settings__label">Base URL (with port)</span>
                 <input
                   className="settings__input"
-                  placeholder="https://api.example.com/v1"
+                  placeholder="e.g. http://192.168.1.50:11434/v1 — include port + /v1"
                   value={form.llm_base_url}
                   onChange={(e) => set("llm_base_url", e.target.value)}
                 />
               </label>
+              <p className="settings__hint">
+                Include the port if the server uses one (e.g. <code>:11434</code> for
+                Ollama, <code>:8080</code> for llama.cpp). Paths usually end in{" "}
+                <code>/v1</code>. Cloud providers need no port:{" "}
+                <code>https://api.groq.com/openai/v1</code>
+              </p>
               <label className="settings__row">
                 <span className="settings__label">API key</span>
                 <input
@@ -236,6 +259,20 @@ export default function SettingsPage() {
                 />
               </label>
             </>
+          )}
+          {provider !== "off" && (
+            <div className="settings__row">
+              <span className="settings__label" />
+              <button
+                className="barbtn"
+                disabled={test.state === "testing"}
+                onClick={testConnection}
+              >
+                {test.state === "testing" ? "Testing…" : "Test connection"}
+              </button>
+              {test.state === "ok" && <span className="settings__ok">✓ {test.msg}</span>}
+              {test.state === "fail" && <span className="upload__error">✕ {test.msg}</span>}
+            </div>
           )}
         </section>
 

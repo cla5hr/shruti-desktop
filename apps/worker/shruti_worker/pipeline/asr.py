@@ -21,7 +21,9 @@ log = logging.getLogger("shruti.asr")
 class AsrBackend(Protocol):
     name: str
 
-    def transcribe(self, wav_path: Path, settings: Settings) -> AsrResult: ...
+    def transcribe(
+        self, wav_path: Path, settings: Settings, progress: ProgressFn | None = None
+    ) -> AsrResult: ...
 
 
 class FasterWhisperBackend:
@@ -31,6 +33,8 @@ class FasterWhisperBackend:
     def _model(self, settings: Settings):
         key = (settings.asr_model, settings.asr_device, settings.asr_compute_type)
         if key not in self._cache:
+            import os
+
             from faster_whisper import WhisperModel  # heavy import, deferred
 
             log.info("loading whisper model %s (%s/%s)", *key)
@@ -38,10 +42,15 @@ class FasterWhisperBackend:
                 settings.asr_model,
                 device=settings.asr_device,
                 compute_type=settings.asr_compute_type,
+                # default is 4 threads; use the machine — a 21-min meeting on 'small'
+                # takes ~30 min at 4 threads on a laptop, every core helps
+                cpu_threads=max(4, (os.cpu_count() or 4) - 2),
             )
         return self._cache[key]
 
-    def transcribe(self, wav_path: Path, settings: Settings) -> AsrResult:
+    def transcribe(
+        self, wav_path: Path, settings: Settings, progress: ProgressFn | None = None
+    ) -> AsrResult:
         model = self._model(settings)
         segments_iter, info = model.transcribe(
             str(wav_path),
@@ -49,8 +58,15 @@ class FasterWhisperBackend:
             word_timestamps=True,
             vad_filter=True,
         )
+        total_s = float(getattr(info, "duration", 0) or 0)
+        last_pct = -1
         segments: list[AsrSegment] = []
         for seg in segments_iter:
+            if progress is not None and total_s:
+                pct = min(99, int(seg.end / total_s * 100))
+                if pct > last_pct:
+                    last_pct = pct
+                    progress({"pct": pct})
             words = [
                 AsrWord(word=w.word.strip(), start_ms=int(w.start * 1000), end_ms=int(w.end * 1000))
                 for w in (seg.words or [])
@@ -185,14 +201,29 @@ def handle_asr(session: Session, job: Job, report_progress: ProgressFn) -> None:
     if backend is None:
         raise RuntimeError(f"unknown ASR backend {settings.asr_backend!r}")
 
+    if settings.asr_device == "cuda":
+        # HARD gate, checked before ctranslate2 ever touches CUDA: with a GPU present
+        # but its libraries missing, ct2's lazy DLL load can HANG (not raise) inside
+        # the Windows loader — the thread parks at 0% CPU forever and the exception
+        # fallback below never fires. The ctypes probe cannot hang.
+        from shruti_core.cuda import cuda_usable
+
+        if not cuda_usable():
+            log.warning("asr_device=cuda but CUDA is not usable here — using CPU")
+            settings = settings.model_copy(update={"asr_device": "cpu", "asr_compute_type": "int8"})
+
     report_progress({"stage": "transcribing", "model": settings.asr_model})
     wav_path = get_storage().path(rec.storage_key_audio_wav)
+
+    def on_progress(p: dict) -> None:
+        report_progress({"stage": "transcribing", "model": settings.asr_model, **p})
+
     try:
-        result = backend.transcribe(wav_path, settings)
+        result = backend.transcribe(wav_path, settings, progress=on_progress)
     except RuntimeError as exc:
-        # A saved asr_device=cuda can still fail at compute time (missing cuBLAS/cuDNN,
-        # driver issues). Fall back to CPU in the same run instead of crash-looping
-        # through retries while the meeting sits in "processing".
+        # second layer: CUDA that passed the probe can still fail at compute time
+        # (driver issues, OOM) — fall back to CPU in the same run instead of
+        # crash-looping through retries while the meeting sits in "processing"
         if settings.asr_device == "cuda" and any(
             marker in str(exc).lower() for marker in ("cublas", "cudnn", "cuda")
         ):
@@ -201,7 +232,7 @@ def handle_asr(session: Session, job: Job, report_progress: ProgressFn) -> None:
                 {"stage": "transcribing", "model": settings.asr_model, "note": "GPU failed → CPU"}
             )
             cpu = settings.model_copy(update={"asr_device": "cpu", "asr_compute_type": "int8"})
-            result = backend.transcribe(wav_path, cpu)
+            result = backend.transcribe(wav_path, cpu, progress=on_progress)
         else:
             raise
 

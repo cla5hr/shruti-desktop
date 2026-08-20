@@ -15,7 +15,7 @@ def fake_asr(monkeypatch, fixtures_dir):
     class FakeBackend:
         name = "fake"
 
-        def transcribe(self, wav_path, settings):
+        def transcribe(self, wav_path, settings, progress=None):
             return result
 
     monkeypatch.setitem(ASR_BACKENDS, "fake", FakeBackend())

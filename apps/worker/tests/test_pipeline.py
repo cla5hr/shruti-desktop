@@ -92,7 +92,7 @@ def test_asr_falls_back_to_cpu_when_gpu_fails(db, tmp_storage, fake_asr, monkeyp
     class GpuBrokenBackend:
         name = "gpu-broken"
 
-        def transcribe(self, wav_path, settings):
+        def transcribe(self, wav_path, settings, progress=None):
             if settings.asr_device == "cuda":
                 raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
             return fake_asr  # CPU path works
@@ -100,6 +100,8 @@ def test_asr_falls_back_to_cpu_when_gpu_fails(db, tmp_storage, fake_asr, monkeyp
     monkeypatch.setitem(BACKENDS, "gpu-broken", GpuBrokenBackend())
     monkeypatch.setenv("ASR_BACKEND", "gpu-broken")
     monkeypatch.setenv("ASR_DEVICE", "cuda")
+    # force the pre-flight CUDA gate open so the exception-fallback path is exercised
+    monkeypatch.setattr("shruti_core.cuda.cuda_usable", lambda: True)
     get_settings.cache_clear()
 
     meeting, rec = make_meeting_with_upload(db, make_wav_bytes(1.0))

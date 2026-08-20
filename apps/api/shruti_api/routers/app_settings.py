@@ -4,7 +4,6 @@ GET is always available (the UI also uses it to learn which features exist in th
 build). PUT only works when a settings file is configured — i.e. the desktop app.
 """
 
-import functools
 import importlib.util
 import time
 from typing import Annotated
@@ -17,6 +16,7 @@ from sqlalchemy.orm import Session
 from shruti_api.deps import get_db
 from shruti_api.serializers import job_public
 from shruti_core import jobs
+from shruti_core.cuda import cuda_usable
 from shruti_core.settings import get_settings
 from shruti_core.userconfig import EDITABLE_KEYS, save_overlay
 
@@ -87,18 +87,10 @@ def _diarization_available() -> bool:
     return importlib.util.find_spec("sherpa_onnx") is not None
 
 
-@functools.cache
 def _cuda_usable() -> bool:
-    """Whether whisper could actually run on a GPU here. Saving asr_device=cuda without
-    this would enqueue jobs that crash-loop on 'cublas64_12.dll not found' — the meeting
-    then sits in 'processing' through ~30 min of retries. Reject it at save time (and
-    hide the GPU option in the UI). Cached: probing doesn't change within a run."""
-    try:
-        import ctranslate2
-
-        return ctranslate2.get_cuda_device_count() > 0
-    except Exception:
-        return False
+    """GPU present AND its CUDA libraries loadable (see shruti_core.cuda) — gates both
+    the save-time validation and whether the UI shows the GPU option at all."""
+    return cuda_usable()
 
 
 def _asr_installed(model_id: str) -> bool | None:
@@ -193,6 +185,22 @@ def put_app_settings(body: SettingsBody) -> dict:
 
     save_overlay(changes)
     return _public()
+
+
+class TestLLMBody(BaseModel):
+    llm_base_url: str
+    llm_model: str
+    llm_api_key: str = ""
+
+
+@router.post("/settings/test-llm")
+def test_llm(body: TestLLMBody) -> dict:
+    """Try the AI settings AS TYPED (nothing is saved): one tiny chat call, so people
+    can confirm the connection works before relying on it for minutes."""
+    from shruti_core.llm import probe
+
+    ok, detail = probe(body.llm_base_url, body.llm_model, body.llm_api_key)
+    return {"ok": ok, "detail": detail}
 
 
 class PrefetchBody(BaseModel):

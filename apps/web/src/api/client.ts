@@ -129,6 +129,13 @@ export const api = {
     send<AppSettings>("/api/settings", "PUT", { values }),
   prefetchAsr: (model: string) =>
     send<JobInfo>("/api/settings/prefetch-asr", "POST", { model }),
+  testLlm: (llm_base_url: string, llm_model: string, llm_api_key: string) =>
+    send<{ ok: boolean; detail: string }>("/api/settings/test-llm", "POST", {
+      llm_base_url,
+      llm_model,
+      llm_api_key,
+    }),
+  cancelJob: (id: string) => send<JobInfo>(`/api/jobs/${id}/cancel`, "POST"),
   job: (id: string) => getJson<JobInfo>(`/api/jobs/${id}`),
   meeting: (id: string) => getJson<MeetingDetail>(`/api/meetings/${id}`),
   transcript: (id: string) => getJson<TranscriptData>(`/api/meetings/${id}/transcript`),

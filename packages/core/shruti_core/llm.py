@@ -161,6 +161,65 @@ def chat_stream(
         ) from exc
 
 
+def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -> tuple[bool, str]:
+    """Test a provider config WITHOUT saving it: one tiny chat call. Returns
+    (ok, human-readable detail) — powers the Settings 'Test connection' button."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        return False, "Base URL must start with http:// or https:// (include the port if any)"
+    if not model.strip():
+        return False, "Enter a model name"
+    messages = [{"role": "user", "content": "Reply with exactly: OK"}]
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    try:
+        if _is_ollama(base):
+            root = base[: -len("/v1")] if base.endswith("/v1") else base
+            resp = httpx.post(
+                f"{root}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"num_predict": 8},
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            reply = resp.json()["message"]["content"]
+        else:
+            resp = httpx.post(
+                f"{base}/chat/completions",
+                json={"model": model, "messages": messages, "max_tokens": 8},
+                headers=headers,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            reply = resp.json()["choices"][0]["message"]["content"]
+        return True, f"Connected — {model} replied: {reply.strip()[:40] or 'OK'}"
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (401, 403):
+            return False, f"Server reached, but the API key was rejected (HTTP {code})"
+        if code == 404:
+            return False, (
+                "Server reached, but model or path not found (HTTP 404) — check the "
+                "model name and that the URL ends in /v1"
+            )
+        return False, f"Server replied with HTTP {code}"
+    except httpx.ConnectError:
+        return False, (
+            "Could not reach that URL — check the address and port, and that the "
+            "server is running"
+        )
+    except httpx.TimeoutException:
+        return False, (
+            f"No reply within {timeout:.0f}s — server busy, wrong port, or a "
+            "firewall in between"
+        )
+    except Exception as exc:
+        return False, f"{exc.__class__.__name__}: {exc}"
+
+
 def _stub_answer(messages: list[dict]) -> str:
     question = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
     return (

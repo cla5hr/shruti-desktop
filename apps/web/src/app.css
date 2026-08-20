@@ -315,6 +315,17 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
 .masthead__eyebrow { color: var(--pen); margin-bottom: 2px; }
 .masthead__title { font-size: 21px; font-weight: 600; line-height: 1.25; margin: 0; }
 .masthead__title--editable { cursor: text; }
+.tray__stop {
+  margin-left: 10px;
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.tray__stop:hover { color: var(--signal); border-color: var(--signal); }
 .masthead__title--editable:hover { text-decoration: underline dotted var(--ink-faint); }
 .masthead__title-input {
   font-family: inherit;
