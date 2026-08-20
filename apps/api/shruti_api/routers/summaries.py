@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from shruti_api.deps import get_db
 from shruti_api.routers.meetings import _job_in_flight
-from shruti_api.serializers import job_public
+from shruti_api.serializers import iso_utc, job_public
 from shruti_core import jobs
 from shruti_core.models import Meeting, Summary, Transcript
 
@@ -26,7 +26,7 @@ def summary_public(s: Summary) -> dict:
         "content_md": s.content_md,
         "model": s.model,
         "edited": s.edited,
-        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "created_at": iso_utc(s.created_at),
     }
 
 

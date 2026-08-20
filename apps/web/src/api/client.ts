@@ -135,6 +135,11 @@ export const api = {
       llm_model,
       llm_api_key,
     }),
+  listLlmModels: (llm_base_url: string, llm_api_key: string) =>
+    send<{ models: string[]; detail: string }>("/api/settings/list-models", "POST", {
+      llm_base_url,
+      llm_api_key,
+    }),
   cancelJob: (id: string) => send<JobInfo>(`/api/jobs/${id}/cancel`, "POST"),
   job: (id: string) => getJson<JobInfo>(`/api/jobs/${id}`),
   meeting: (id: string) => getJson<MeetingDetail>(`/api/meetings/${id}`),
@@ -167,8 +172,12 @@ export const api = {
     ),
   retranscribe: (meetingId: string) =>
     send<JobInfo>(`/api/meetings/${meetingId}/retranscribe`, "POST"),
-  rediarize: (meetingId: string) =>
-    send<JobInfo>(`/api/meetings/${meetingId}/rediarize`, "POST"),
+  rediarize: (meetingId: string, numSpeakers?: number) =>
+    send<JobInfo>(
+      `/api/meetings/${meetingId}/rediarize`,
+      "POST",
+      numSpeakers === undefined ? undefined : { num_speakers: numSpeakers },
+    ),
   deleteMeeting: async (id: string): Promise<void> => {
     const resp = await fetch(`/api/meetings/${id}`, { method: "DELETE" });
     if (!resp.ok && resp.status !== 204) throw new Error(`delete failed (${resp.status})`);

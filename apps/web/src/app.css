@@ -109,6 +109,20 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
   border-top: 1px solid var(--grid);
 }
 .speakers__hint { font-size: 11.5px; color: var(--ink-faint); }
+.settings__reload {
+  flex: 0 0 auto;
+  min-width: 34px;
+  padding: 4px 8px;
+}
+.speakers__people {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+.speakers__people-input { width: 58px; }
 
 /* settings link (sidebar bottom) + settings page */
 .sidebar__settings {

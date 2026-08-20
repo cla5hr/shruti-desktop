@@ -60,20 +60,25 @@ def _is_ollama(base_url: str) -> bool:
 _ollama_cache: tuple[float, str, list[str] | None] = (0.0, "", None)
 
 
-def _ollama_models(base_url: str) -> list[str] | None:
+def _ollama_models(
+    base_url: str, timeout: float = 0.5, use_cache: bool = True
+) -> list[str] | None:
     """Installed Ollama models, or None when the server isn't reachable.
 
     Short timeout + 5s cache: when Ollama is NOT running, a localhost connect on
     Windows hangs until the timeout rather than refusing — with the old 2s timeout
-    every Settings load took 2+ seconds."""
+    every Settings load took 2+ seconds. Save-time validation passes a longer
+    timeout and bypasses the cache: rejecting a save because a remote server
+    needed 0.6s (or because a failed page-load probe was cached) is worse than a
+    save taking a few seconds."""
     global _ollama_cache
     ts, cached_url, cached = _ollama_cache
-    if cached_url == base_url and time.monotonic() - ts < 5:
+    if use_cache and cached_url == base_url and time.monotonic() - ts < 5:
         return cached
     root = base_url.rstrip("/")
     root = root[: -len("/v1")] if root.endswith("/v1") else root
     try:
-        r = httpx.get(f"{root}/api/tags", timeout=0.5)
+        r = httpx.get(f"{root}/api/tags", timeout=timeout)
         r.raise_for_status()
         models = [m["name"] for m in r.json().get("models", [])]
     except Exception:
@@ -114,6 +119,9 @@ def _current_values() -> dict:
 def _public() -> dict:
     s = get_settings()
     ollama_models = _ollama_models(s.llm_base_url) if _is_ollama(s.llm_base_url) else None
+    # embedding-only models can't chat — offering them in the minutes picker just
+    # sets people up for a failed summary (validation still accepts them if typed)
+    pickable = [m for m in (ollama_models or []) if "embed" not in m.lower()]
     return {
         "values": _current_values(),
         "meta": {
@@ -121,7 +129,7 @@ def _public() -> dict:
             "diarization_available": _diarization_available(),
             "cuda_available": _cuda_usable(),
             "asr_models": [{**m, "installed": _asr_installed(m["id"])} for m in ASR_CHOICES],
-            "ollama": {"running": ollama_models is not None, "models": ollama_models or []},
+            "ollama": {"running": ollama_models is not None, "models": pickable},
         },
     }
 
@@ -169,22 +177,43 @@ def put_app_settings(body: SettingsBody) -> dict:
         if not model:
             raise HTTPException(status_code=400, detail="pick or type an AI model name")
         if _is_ollama(base):
-            installed = _ollama_models(base)
+            local = "localhost" in base or "127.0.0.1" in base
+            installed = _ollama_models(base, timeout=5.0, use_cache=False)
             if installed is None:
                 raise HTTPException(
                     status_code=400,
-                    detail="Ollama isn't running — start it (or choose another provider)",
+                    detail=(
+                        "Ollama isn't running — start it (or choose another provider)"
+                        if local
+                        else f"Can't reach the Ollama server at {base} — check the "
+                        "address and that it's up"
+                    ),
                 )
             if model not in installed:
                 have = ", ".join(installed) if installed else "none installed"
+                hint = f"Run: ollama pull {model}" if local else "Pick one of the listed models."
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Ollama doesn't have '{model}'. Installed: {have}. "
-                    f"Run: ollama pull {model}",
+                    detail=f"That server doesn't have '{model}'. Installed: {have}. {hint}",
                 )
 
     save_overlay(changes)
     return _public()
+
+
+class ListModelsBody(BaseModel):
+    llm_base_url: str
+    llm_api_key: str = ""
+
+
+@router.post("/settings/list-models")
+def list_llm_models(body: ListModelsBody) -> dict:
+    """Models offered by the endpoint AS TYPED (nothing is saved) — fills the
+    Settings model dropdown for hosted providers the same way local Ollama does."""
+    from shruti_core.llm import list_models
+
+    models, detail = list_models(body.llm_base_url, body.llm_api_key)
+    return {"models": models, "detail": detail}
 
 
 class TestLLMBody(BaseModel):

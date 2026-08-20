@@ -34,7 +34,7 @@ class Turn(NamedTuple):
 class DiarizeBackend(Protocol):
     name: str
 
-    def diarize(self, wav_path: Path, settings: Settings) -> list[Turn]: ...
+    def diarize(self, wav_path: Path, settings: Settings, num_speakers: int = 0) -> list[Turn]: ...
 
 
 def _preload_ort() -> None:
@@ -112,14 +112,18 @@ class SherpaBackend:
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
         "speaker-recongition-models/nemo_en_titanet_large.onnx"
     )
-    # Embedder + threshold chosen by benchmark (2026-08-19) on LABELED 2- and 3-speaker
-    # fixtures, both clean and degraded (bandlimit + echo + 16 kbps codec, simulating
-    # real meeting capture): TitaNet-large is correct with near-ceiling frame accuracy
-    # across t0.6–0.8 on ALL of them; 0.7 is mid-band. WeSpeaker CAM++ (the previous
-    # embedder) never got speaker count and attribution right at the same threshold,
-    # and WeSpeaker ResNet34-LM collapsed on real-world audio. The threshold scale is
-    # embedder-specific — re-sweep on the labeled fixtures before changing either.
-    CLUSTER_THRESHOLD = 0.7
+    # Embedder chosen by benchmark (2026-08-19) on LABELED 2- and 3-speaker fixtures,
+    # both clean and degraded: TitaNet-large beat WeSpeaker CAM++ and ResNet34-LM.
+    # Threshold re-swept 2026-08-20 against (a) the TTS fixture and (b) a real 6.6-min
+    # 2-person Windows capture (mic + system audio, echoey):
+    #   0.7 — fixture ✓ (2 spk, right turns) but the REAL capture shattered into 17
+    #         raw clusters (5 survived the junk filter → "5 speakers" bug), and even
+    #         pinning num_speakers=2 merged wrongly (317s/10s split);
+    #   0.9 — fixture ✓ IDENTICAL turns, real capture ✓ resolves to the two true
+    #         voices (215s/99s) with only sub-floor junk clusters;
+    #   1.1 — fixture ✗ collapses both voices into one speaker.
+    # The threshold scale is embedder-specific — re-sweep both files before changing.
+    CLUSTER_THRESHOLD = 0.9
 
     def _dir(self, settings: Settings) -> Path:
         base = settings.sherpa_models_dir or "./data/models/sherpa"
@@ -148,13 +152,11 @@ class SherpaBackend:
             raise RuntimeError("speaker model download finished but files are missing")
         return seg, emb
 
-    def diarize(self, wav_path: Path, settings: Settings) -> list[Turn]:
+    def diarize(self, wav_path: Path, settings: Settings, num_speakers: int = 0) -> list[Turn]:
         if importlib.util.find_spec("sherpa_onnx") is None:
             raise RuntimeError("sherpa-onnx not installed - pip install sherpa-onnx")
 
         seg, emb = self._ensure_models(settings)
-        # pinning the real head-count (Settings) beats any auto-clustering heuristic
-        num_speakers = int(settings.diarize_num_speakers or 0)
 
         ctx = multiprocessing.get_context("spawn")
         with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
@@ -189,6 +191,17 @@ def _min_speech_s(duration_s: float) -> float:
     """Speech floor for a real speaker: 5% of the recording, clamped to [2s, 10s] —
     short clips keep quick exchanges, long meetings shed sub-10-second junk."""
     return min(10.0, max(2.0, 0.05 * duration_s))
+
+
+def renumber_labels(turns: list[Turn]) -> list[Turn]:
+    """After junk clusters are dropped, the surviving raw labels can be sparse
+    (SPEAKER_01, SPEAKER_04) — renumber by first appearance so users always see
+    SPEAKER_00, SPEAKER_01, … Pure function — unit-tested."""
+    mapping: dict[str, str] = {}
+    for t in turns:
+        if t.label not in mapping:
+            mapping[t.label] = f"SPEAKER_{len(mapping):02d}"
+    return [Turn(t.start_ms, t.end_ms, mapping[t.label]) for t in turns]
 
 
 def _best_label(start_ms: int, end_ms: int, turns: list[Turn]) -> str | None:
@@ -284,21 +297,41 @@ def handle_diarize(session: Session, job: Job, report_progress: ProgressFn) -> N
     if not rec.storage_key_audio_wav:
         raise RuntimeError("diarize requested before extract_audio produced audio.wav")
 
-    transcript_id = uuid.UUID(str(job.payload["transcript_id"]))
-    transcript = session.get(Transcript, transcript_id)
+    # ALWAYS operate on the meeting's active transcript, resolved at RUN time.
+    # Jobs carry the transcript that was active when they were ENQUEUED; if the user
+    # retranscribes (or re-detects) while another run is in flight, the stale job
+    # would rebuild an old transcript and — because the rebuild nulls speaker_id
+    # across every transcript version first — wipe the fresh one's speakers too.
+    transcript = session.scalars(
+        select(Transcript).where(Transcript.meeting_id == meeting.id, Transcript.is_active)
+    ).first()
     if transcript is None:
-        raise RuntimeError(f"transcript {transcript_id} not found")
+        raise RuntimeError(f"meeting {meeting.id} has no active transcript to diarize")
+    payload_tid = job.payload.get("transcript_id")
+    if payload_tid and uuid.UUID(str(payload_tid)) != transcript.id:
+        log.info(
+            "diarize job %s targeted stale transcript %s; using active %s",
+            job.id, payload_tid, transcript.id,
+        )
 
     backend = BACKENDS.get(settings.diarize_backend)
     if backend is None:
         raise RuntimeError(f"unknown diarize backend {settings.diarize_backend!r}")
 
+    # head-count priority: this job's explicit request (Speakers panel) > Settings.
+    # Pinning the real head-count beats any auto-clustering heuristic.
+    raw_ns = job.payload.get("num_speakers")
+    num_speakers = int(raw_ns) if raw_ns is not None else int(settings.diarize_num_speakers or 0)
+
     report_progress({"stage": "diarizing"})
-    turns = backend.diarize(get_storage().path(rec.storage_key_audio_wav), settings)
+    turns = backend.diarize(
+        get_storage().path(rec.storage_key_audio_wav), settings, num_speakers
+    )
 
     # auto-detect mode only: a user-pinned head-count already forces the cluster count
-    if not settings.diarize_num_speakers:
+    if not num_speakers:
         turns = drop_minor_speakers(turns, _min_speech_s(rec.duration_s or 0.0))
+        turns = renumber_labels(turns)
 
     old_segments = list(
         session.scalars(
@@ -371,5 +404,8 @@ def handle_diarize(session: Session, job: Job, report_progress: ProgressFn) -> N
         queue="io",
         meeting_id=meeting.id,
         payload={"transcript_id": str(transcript.id), "template": "standard"},
-        dedupe_key=f"summarize:{transcript.id}:standard",
+        # scoped to THIS diarize run: dedupe keys are unique forever, so a key
+        # without job.id would silently skip the summary refresh on every
+        # re-detect after the first (speakers change, minutes stay stale)
+        dedupe_key=f"summarize:{transcript.id}:standard:{job.id}",
     )

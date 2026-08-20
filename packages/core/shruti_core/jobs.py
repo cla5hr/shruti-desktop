@@ -23,6 +23,12 @@ BACKOFF_BASE_SECONDS = 30
 BACKOFF_CAP_SECONDS = 3600
 
 
+class PermanentJobError(RuntimeError):
+    """A handler failure that can never succeed on retry (e.g. ffmpeg says the
+    uploaded file isn't valid media). The worker fails the job immediately
+    instead of retrying for ~15 minutes while the user stares at QUEUED."""
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -105,13 +111,14 @@ def complete(session: Session, job: Job, progress: dict | None = None) -> None:
     session.commit()
 
 
-def fail(session: Session, job: Job, error: str) -> None:
-    """Record a failure: retry with backoff, or mark failed when attempts are exhausted."""
+def fail(session: Session, job: Job, error: str, *, permanent: bool = False) -> None:
+    """Record a failure: retry with backoff, or mark failed when attempts are
+    exhausted. permanent=True skips the retries entirely (PermanentJobError)."""
     job.attempts += 1
     job.error = error[:10_000]
     job.locked_by = None
     job.heartbeat_at = None
-    if job.attempts >= job.max_attempts:
+    if permanent or job.attempts >= job.max_attempts:
         job.status = "failed"
         job.finished_at = _now()
     else:

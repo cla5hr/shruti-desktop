@@ -1,9 +1,22 @@
 """Row -> JSON shapes shared by routers."""
 
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from shruti_core.models import Job, Meeting, Recording, Transcript
+
+
+def iso_utc(dt: datetime | None) -> str | None:
+    """ISO-8601 with an explicit UTC marker. The DB stores naive UTC (SQLite
+    CURRENT_TIMESTAMP); serializing it without a 'Z' made `new Date(...)` in the
+    browser parse it as LOCAL time, so every meeting displayed in UTC (5½ hours
+    off in IST)."""
+    if dt is None:
+        return None
+    iso = dt.isoformat()
+    return iso if dt.tzinfo is not None else iso + "Z"
 
 
 def job_public(job: Job) -> dict:
@@ -16,8 +29,8 @@ def job_public(job: Job) -> dict:
         "progress": job.progress,
         "error": job.error,
         "meeting_id": str(job.meeting_id) if job.meeting_id else None,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "created_at": iso_utc(job.created_at),
+        "finished_at": iso_utc(job.finished_at),
     }
 
 
@@ -28,7 +41,7 @@ def meeting_summary(m: Meeting) -> dict:
         "source": m.source,
         "status": m.status,
         "duration_s": m.duration_s,
-        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "created_at": iso_utc(m.created_at),
     }
 
 

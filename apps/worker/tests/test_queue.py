@@ -97,3 +97,14 @@ def test_stalled_jobs_are_requeued(db):
     assert job.status == "queued"
     assert job.attempts == 1
     assert "stalled" in (job.error or "")
+
+
+def test_permanent_fail_skips_retries(db):
+    from shruti_core import jobs as q
+
+    job = q.enqueue(db, "noop", queue="io", payload={})
+    job.status = "running"
+    db.commit()
+    q.fail(db, job, "unfixable", permanent=True)
+    assert job.status == "failed"
+    assert job.attempts == 1

@@ -138,3 +138,29 @@ def test_corrupt_upload_fails_meeting(db, tmp_storage):
     job = db.scalars(select(Job).where(Job.type == "extract_audio")).one()
     assert job.status == "failed"
     assert "ffmpeg" in (job.error or "").lower()
+
+
+def test_invalid_media_fails_fast(db, tmp_storage):
+    """A file ffmpeg can never read must fail on the FIRST attempt (and take the
+    meeting to 'failed'), not spend ~15 minutes in retry backoff showing QUEUED."""
+    from helpers import make_meeting_with_upload
+    from sqlalchemy import select
+
+    from shruti_core import jobs as q
+    from shruti_core.models import Job
+    from shruti_worker.main import run_until_idle
+
+    meeting, rec = make_meeting_with_upload(db, b"this is not audio at all", ext=".mp3")
+    q.enqueue(
+        db, "extract_audio", queue="io", meeting_id=meeting.id,
+        payload={"recording_id": str(rec.id)},
+    )
+    run_until_idle(["io"])
+
+    job = db.scalars(
+        select(Job).where(Job.meeting_id == meeting.id, Job.type == "extract_audio")
+    ).one()
+    assert job.status == "failed"
+    assert job.attempts == 1
+    db.refresh(meeting)
+    assert meeting.status == "failed"

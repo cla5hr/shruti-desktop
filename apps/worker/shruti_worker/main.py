@@ -96,6 +96,12 @@ def run_one(session, job: Job) -> None:
         session.rollback()
         log.info("job %s (%s) cancelled by user", job.id, job.type)
         _settle_meeting_after_cancel(session, job)
+    except jobs.PermanentJobError:
+        err = traceback.format_exc()
+        log.error("job %s (%s) failed permanently:\n%s", job.id, job.type, err)
+        session.rollback()
+        jobs.fail(session, job, err, permanent=True)
+        _mark_meeting_failed_if_terminal(session, job)
     except Exception:
         err = traceback.format_exc()
         log.error("job %s (%s) failed:\n%s", job.id, job.type, err)

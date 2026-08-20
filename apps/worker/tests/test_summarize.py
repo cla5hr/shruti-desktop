@@ -182,3 +182,134 @@ def test_clean_minutes_strips_model_artifacts():
     assert "SPEAKER_3" not in cleaned  # invented speaker bullet dropped
     assert "SPEAKER_00 confirmed the schedule" in cleaned  # real speaker kept
     assert "send the report" in cleaned
+
+
+def test_empty_transcript_persists_unavailable_notice(db, tmp_storage):
+    """ZERO segments (silent capture) must persist an explanation and succeed —
+    it used to raise 'no segments to summarize' and retry for ~15 minutes while
+    the meeting showed no minutes and no reason why."""
+    from shruti_core import jobs as q
+    from shruti_worker.main import run_until_idle
+
+    meeting = Meeting(source="upload", title="dead air", status="ready")
+    db.add(meeting)
+    db.flush()
+    transcript = Transcript(
+        meeting_id=meeting.id, kind="whisper_raw", engine="fake", model="t", is_active=True
+    )
+    db.add(transcript)
+    db.commit()
+
+    job = q.enqueue(
+        db,
+        "summarize",
+        queue="io",
+        meeting_id=meeting.id,
+        payload={"transcript_id": str(transcript.id), "template": "standard"},
+    )
+    run_until_idle(["io"])
+
+    db.refresh(job)
+    assert job.status == "succeeded"
+    summary = db.scalars(select(Summary).where(Summary.meeting_id == meeting.id)).one()
+    assert "Minutes unavailable" in summary.content_md
+    assert "0 words" in summary.content_md
+
+
+def test_stale_summarize_targets_active_transcript(db, tmp_storage, monkeypatch):
+    """A summarize job for an OLD transcript version must summarize the ACTIVE one —
+    a stale job finishing last used to demote the fresh summary and activate one
+    built from outdated text."""
+    from shruti_core import jobs as q
+    from shruti_worker.main import run_until_idle
+
+    meeting = Meeting(source="upload", title="race", status="ready")
+    db.add(meeting)
+    db.flush()
+    words = " ".join(f"word{i}" for i in range(40))
+    old = Transcript(
+        meeting_id=meeting.id, kind="whisper_raw", engine="fake", model="t", is_active=False
+    )
+    new = Transcript(
+        meeting_id=meeting.id, kind="whisper_raw", engine="fake", model="t", is_active=True
+    )
+    db.add_all([old, new])
+    db.flush()
+    for t in (old, new):
+        seg = make_segment(0, words)
+        seg.transcript_id = t.id
+        db.add(seg)
+    db.commit()
+
+    monkeypatch.setattr(sz, "chat", lambda messages, **kw: "## Summary\n\nMinutes text here.")
+    job = q.enqueue(
+        db,
+        "summarize",
+        queue="io",
+        meeting_id=meeting.id,
+        payload={"transcript_id": str(old.id), "template": "standard"},
+    )
+    run_until_idle(["io"])
+
+    db.refresh(job)
+    assert job.status == "succeeded"
+    active = db.scalars(
+        select(Summary).where(Summary.meeting_id == meeting.id, Summary.is_active)
+    ).one()
+    assert str(active.transcript_id) == str(new.id)
+
+
+def test_clean_minutes_zero_padding_and_prose():
+    from shruti_worker.pipeline.summarize import clean_minutes
+
+    raw = "\n".join(
+        [
+            "## Summary",
+            "This paragraph mentions Speaker 7 in passing but is prose, not a bullet.",
+            "## Action Items",
+            "- **Speaker 1** — send the report",
+            "- **Speaker 4** — invented task",
+        ]
+    )
+    cleaned = clean_minutes(raw, {"SPEAKER_00", "SPEAKER_01"})
+    # "Speaker 1" is SPEAKER_01 without zero-padding — a real speaker, kept
+    assert "send the report" in cleaned
+    # Speaker 4 doesn't exist — invented bullet dropped
+    assert "invented task" not in cleaned
+    # prose lines are never dropped, even when they mention unknown speaker numbers
+    # (models hard-wrap paragraphs; dropping wrapped lines shredded real summaries)
+    assert "in passing" in cleaned
+
+
+def test_decimating_cleanup_falls_back_to_mild_pass(db, tmp_storage, monkeypatch):
+    """If the strict cleanup would delete most of a substantial answer, keep the
+    answer (minus echoed instructions) instead of persisting a one-line husk."""
+    from shruti_core import jobs as q
+    from shruti_worker.main import run_until_idle
+
+    meeting = Meeting(source="upload", title="fallback", status="ready")
+    db.add(meeting)
+    db.flush()
+    transcript = Transcript(
+        meeting_id=meeting.id, kind="whisper_raw", engine="fake", model="t", is_active=True
+    )
+    db.add(transcript)
+    db.flush()
+    seg = make_segment(0, " ".join(f"word{i}" for i in range(40)), "SPEAKER_00")
+    seg.transcript_id = transcript.id
+    db.add(seg)
+    db.commit()
+
+    bullets = "\n".join(f"- Speaker 9 point number {i} with some detail" for i in range(12))
+    monkeypatch.setattr(sz, "chat", lambda messages, **kw: "## Summary\n\nOne line.\n" + bullets)
+    q.enqueue(
+        db,
+        "summarize",
+        queue="io",
+        meeting_id=meeting.id,
+        payload={"transcript_id": str(transcript.id), "template": "standard"},
+    )
+    run_until_idle(["io"])
+
+    summary = db.scalars(select(Summary).where(Summary.meeting_id == meeting.id)).one()
+    assert "point number 3" in summary.content_md  # mild fallback kept the content

@@ -60,6 +60,7 @@ function EditableTitle({ meetingId, title }: { meetingId: string; title: string 
     <h1
       className="masthead__title masthead__title--editable"
       title="Click to rename"
+      aria-label={`${title || "Untitled meeting"} — click to rename`}
       onClick={() => {
         setDraft(title);
         setEditing(true);

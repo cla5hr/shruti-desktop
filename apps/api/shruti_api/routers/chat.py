@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from shruti_api.deps import get_db
+from shruti_api.serializers import iso_utc
 from shruti_core.db import new_session
 from shruti_core.llm import LLMError, chat_stream, estimate_tokens
 from shruti_core.models import (
@@ -96,7 +97,7 @@ def thread_public(t: ChatThread) -> dict:
     return {
         "id": str(t.id),
         "title": t.title,
-        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "created_at": iso_utc(t.created_at),
     }
 
 
@@ -105,7 +106,7 @@ def message_public(m: ChatMessage) -> dict:
         "id": str(m.id),
         "role": m.role,
         "content": m.content,
-        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "created_at": iso_utc(m.created_at),
     }
 
 

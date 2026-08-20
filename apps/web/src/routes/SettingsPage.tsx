@@ -1,7 +1,16 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type AppSettingsValues } from "../api/client";
 import { useAppSettings } from "../api/hooks";
+
+/** What a saved config looks like. Only a LOCAL 11434 URL means "Ollama on this
+ *  computer"; a remote Ollama box (e.g. the company GPU server) is an endpoint. */
+function deriveProvider(v: AppSettingsValues): string {
+  if (v.llm_mode !== "live") return "off";
+  return /https?:\/\/(localhost|127\.0\.0\.1):11434/.test(v.llm_base_url) ? "ollama" : "endpoint";
+}
+
+const MANUAL = "__manual__";
 
 /** In-app settings (desktop build): transcription model, speakers, minutes provider. */
 export default function SettingsPage() {
@@ -19,10 +28,53 @@ export default function SettingsPage() {
     state: "idle",
     msg: "",
   });
+  // The user's explicit provider choice. null = not chosen yet this visit, fall
+  // back to what the saved config looks like. This MUST be real state: deriving it
+  // from the URL on every render meant typing any ":11434" URL (e.g. a company
+  // Ollama server) silently flipped the form back to "Ollama on this computer",
+  // hid the URL/key fields mid-keystroke, and made Test connection probe localhost.
+  const [providerChoice, setProviderChoice] = useState<string | null>(null);
+  // Models the hosted endpoint offers, so it gets the same pick-from-a-list UX as
+  // local Ollama instead of a bare text box you must type an exact id into.
+  const [endpointModels, setEndpointModels] = useState<string[] | null>(null);
+  const [modelsState, setModelsState] = useState<{
+    state: "idle" | "loading" | "empty";
+    msg: string;
+  }>({ state: "idle", msg: "" });
+  const [typeManually, setTypeManually] = useState(false);
+  const loadedFor = useRef("");
 
   useEffect(() => {
     if (data && form === null) setForm({ ...data.values });
   }, [data, form]);
+
+  const loadModels = useCallback(async (url: string, key: string) => {
+    setModelsState({ state: "loading", msg: "" });
+    try {
+      const r = await api.listLlmModels(url, key);
+      setEndpointModels(r.models);
+      setModelsState(
+        r.models.length ? { state: "idle", msg: "" } : { state: "empty", msg: r.detail },
+      );
+    } catch (e) {
+      setEndpointModels([]);
+      setModelsState({
+        state: "empty",
+        msg: e instanceof Error ? e.message : "could not load the model list",
+      });
+    }
+  }, []);
+
+  // fill the dropdown on arrival when the SAVED provider is a hosted endpoint
+  // (keyed on the saved URL, not the form — typing must not fire a request per keystroke)
+  useEffect(() => {
+    if (!data) return;
+    const saved = data.values;
+    const url = saved.llm_base_url.trim();
+    if (deriveProvider(saved) !== "endpoint" || !url || loadedFor.current === url) return;
+    loadedFor.current = url;
+    void loadModels(url, saved.llm_api_key);
+  }, [data, loadModels]);
 
   if (isLoading || !data || !form) {
     return (
@@ -38,11 +90,11 @@ export default function SettingsPage() {
     setStatus("idle");
   };
 
-  // The provider select folds llm_mode + base URL into one honest choice.
-  const provider =
-    form.llm_mode !== "live" ? "off" : form.llm_base_url.includes(":11434") ? "ollama" : "endpoint";
+  // The saved config only decides the initial view; an explicit pick always wins.
+  const provider = providerChoice ?? deriveProvider(form);
 
   const setProvider = (p: string) => {
+    setProviderChoice(p);
     if (p === "off") setForm({ ...form, llm_mode: "stub" });
     else if (p === "ollama")
       setForm({ ...form, llm_mode: "live", llm_base_url: "http://localhost:11434/v1" });
@@ -51,9 +103,18 @@ export default function SettingsPage() {
     setTest({ state: "idle", msg: "" });
   };
 
+  /** (Re)load the endpoint's model list for what's typed right now. */
+  const refreshModels = (force = false) => {
+    const url = form.llm_base_url.trim();
+    if (!url || (!force && loadedFor.current === url)) return;
+    loadedFor.current = url;
+    void loadModels(url, form.llm_api_key);
+  };
+
   const testConnection = async () => {
     setTest({ state: "testing", msg: "" });
     try {
+      // always test exactly what would be saved — never a hardcoded URL
       const base =
         provider === "ollama" ? "http://localhost:11434/v1" : form.llm_base_url;
       const r = await api.testLlm(base, form.llm_model, form.llm_api_key);
@@ -231,6 +292,8 @@ export default function SettingsPage() {
                   placeholder="e.g. http://192.168.1.50:11434/v1 — include port + /v1"
                   value={form.llm_base_url}
                   onChange={(e) => set("llm_base_url", e.target.value)}
+                  onBlur={() => refreshModels()}
+                  onKeyDown={(e) => e.key === "Enter" && refreshModels()}
                 />
               </label>
               <p className="settings__hint">
@@ -247,17 +310,72 @@ export default function SettingsPage() {
                   placeholder="sk-… (leave empty if your server needs none)"
                   value={form.llm_api_key}
                   onChange={(e) => set("llm_api_key", e.target.value)}
+                  // a key added after the first (unauthorized) load must re-list
+                  onBlur={() => refreshModels(true)}
                 />
               </label>
               <label className="settings__row">
                 <span className="settings__label">Model</span>
-                <input
-                  className="settings__input"
-                  placeholder="e.g. gpt-4o-mini"
-                  value={form.llm_model}
-                  onChange={(e) => set("llm_model", e.target.value)}
-                />
+                {endpointModels && endpointModels.length > 0 && !typeManually ? (
+                  <select
+                    className="settings__input"
+                    value={form.llm_model}
+                    onChange={(e) => {
+                      if (e.target.value === MANUAL) {
+                        setTypeManually(true);
+                        return;
+                      }
+                      set("llm_model", e.target.value);
+                    }}
+                  >
+                    {!endpointModels.includes(form.llm_model) && (
+                      <option value={form.llm_model}>
+                        {form.llm_model || "— pick a model —"}
+                      </option>
+                    )}
+                    {endpointModels.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                    <option value={MANUAL}>✎ Type a model name…</option>
+                  </select>
+                ) : (
+                  <input
+                    className="settings__input"
+                    placeholder="e.g. gpt-4o-mini"
+                    value={form.llm_model}
+                    onChange={(e) => set("llm_model", e.target.value)}
+                  />
+                )}
+                <button
+                  className="barbtn settings__reload"
+                  type="button"
+                  disabled={modelsState.state === "loading"}
+                  title="Load the models this server offers"
+                  onClick={() => {
+                    setTypeManually(false);
+                    refreshModels(true);
+                  }}
+                >
+                  {modelsState.state === "loading" ? "…" : "↻"}
+                </button>
               </label>
+              {modelsState.state === "loading" && (
+                <p className="settings__hint">Loading the model list…</p>
+              )}
+              {modelsState.state === "empty" && (
+                <p className="settings__hint">
+                  {modelsState.msg} — type the model name from your provider's docs, then
+                  press ↻ to try listing again.
+                </p>
+              )}
+              {modelsState.state === "idle" && endpointModels && endpointModels.length > 0 && (
+                <p className="settings__hint">
+                  {endpointModels.length} model{endpointModels.length === 1 ? "" : "s"} available
+                  on this server.
+                </p>
+              )}
             </>
           )}
           {provider !== "off" && (

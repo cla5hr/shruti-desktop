@@ -49,6 +49,15 @@ _KNOWN_HEADINGS = (
 )
 
 
+def _strip_instruction_echoes(content: str) -> str:
+    """Mildest cleanup: drop only lines that echo the prompt instructions."""
+    return "\n".join(
+        line
+        for line in content.splitlines()
+        if not any(fragment in line.strip().lower() for fragment in _INSTRUCTION_ECHOES)
+    ).strip()
+
+
 def clean_minutes(content: str, known_speaker_names: set[str]) -> str:
     """Deterministic cleanup of small-model artifacts (see colleague's app: 'fix it in
     post-processing, not the prompt'): echoed instructions, heading descriptions,
@@ -56,6 +65,13 @@ def clean_minutes(content: str, known_speaker_names: set[str]) -> str:
     import re
 
     known_labels = {n.lower() for n in known_speaker_names}
+    # numeric identities of the real speakers: SPEAKER_01 -> 1, so a model writing
+    # "Speaker 1" (no zero-padding) still counts as a real mention, not an invention
+    known_nums: set[int] = set()
+    for name in known_labels:
+        m = re.fullmatch(r"speaker[_ ]?0*(\d+)", name)
+        if m:
+            known_nums.add(int(m.group(1)))
     out: list[str] = []
     for line in content.splitlines():
         # "## Key Points — bullet list of..." → "## Key Points" (BEFORE the echo
@@ -68,12 +84,16 @@ def clean_minutes(content: str, known_speaker_names: set[str]) -> str:
         # "- - [ ] task" → "- [ ] task"
         if line.lstrip().startswith("- - "):
             line = line.replace("- - ", "- ", 1)
-        # a bullet about SPEAKER_N when no such speaker exists = invented content
-        mentioned = {m.lower() for m in re.findall(r"speaker[_ ]?\d+", line, flags=re.IGNORECASE)}
-        if mentioned and not any(
-            m in known_labels or m.replace(" ", "_") in known_labels for m in mentioned
-        ):
-            continue
+        # a BULLET about Speaker N when no such speaker exists = invented content.
+        # Only bullets: dropping wrapped prose lines used to shred real summaries
+        # down to a single orphan line.
+        if low.startswith(("-", "*", "•")):
+            nums = {int(m) for m in re.findall(r"speaker[_ ]?0*(\d+)", low)}
+            if nums and known_nums and not nums.issubset(known_nums):
+                continue
+            if nums and not known_nums:
+                # transcript has only renamed/real names — any "Speaker N" is invented
+                continue
         out.append(line)
     return "\n".join(out).strip()
 
@@ -168,15 +188,28 @@ def persist_summary(
 @register("summarize")
 def handle_summarize(session: Session, job: Job, report_progress: ProgressFn) -> None:
     settings = get_settings()
-    transcript_id = uuid.UUID(str(job.payload["transcript_id"]))
     template_key = job.payload.get("template", "standard")
     if template_key not in TEMPLATES:
         raise RuntimeError(f"unknown summary template {template_key!r}")
 
-    transcript = session.get(Transcript, transcript_id)
+    # Resolve the transcript at RUN time: jobs snapshot a transcript_id at enqueue
+    # time, and a stale job finishing LAST used to demote the current transcript's
+    # perfectly good summary in favour of an outdated one. Summarize whatever is
+    # active NOW; the payload id is only used to locate the meeting.
+    payload_transcript = session.get(Transcript, uuid.UUID(str(job.payload["transcript_id"])))
+    if payload_transcript is None:
+        raise RuntimeError(f"transcript {job.payload['transcript_id']} not found")
+    meeting = session.get(Meeting, payload_transcript.meeting_id)
+    transcript = session.scalars(
+        select(Transcript).where(Transcript.meeting_id == meeting.id, Transcript.is_active)
+    ).first()
     if transcript is None:
-        raise RuntimeError(f"transcript {transcript_id} not found")
-    meeting = session.get(Meeting, transcript.meeting_id)
+        transcript = payload_transcript
+    elif transcript.id != payload_transcript.id:
+        log.info(
+            "summarize job %s targeted stale transcript %s; using active %s",
+            job.id, payload_transcript.id, transcript.id,
+        )
     segments = list(
         session.scalars(
             select(TranscriptSegment)
@@ -184,8 +217,6 @@ def handle_summarize(session: Session, job: Job, report_progress: ProgressFn) ->
             .order_by(TranscriptSegment.idx)
         )
     )
-    if not segments:
-        raise RuntimeError("transcript has no segments to summarize")
     names = {
         s.id: s.display_name
         for s in session.scalars(select(Speaker).where(Speaker.meeting_id == meeting.id))
@@ -193,8 +224,11 @@ def handle_summarize(session: Session, job: Job, report_progress: ProgressFn) ->
 
     text = transcript_lines(segments, names)
 
-    # Guard: an empty/near-silent recording produces a tiny transcript; a small LLM
-    # will HALLUCINATE minutes with invented [m:ss] citations. Refuse instead.
+    # Guard: an empty/near-silent recording produces a tiny (or empty) transcript;
+    # a small LLM will HALLUCINATE minutes with invented [m:ss] citations. Persist a
+    # plain explanation instead — never raise, because "no speech" can't be fixed by
+    # retrying, and the old raise left users staring at a meeting with no minutes
+    # and no reason why.
     word_count = sum(len(seg.text.split()) for seg in segments)
     if word_count < MIN_WORDS_FOR_MINUTES:
         content = (
@@ -212,7 +246,17 @@ def handle_summarize(session: Session, job: Job, report_progress: ProgressFn) ->
         # the old minutes get replaced (report_progress raises JobCancelled)
         report_progress({"stage": "persisting"})
         known = set(names.values()) | {seg.speaker_label for seg in segments if seg.speaker_label}
+        raw = content
         content = clean_minutes(content, known)
+        # decimation guard: if the strict cleanup ate most of a substantial answer
+        # (models sometimes hard-wrap prose, and a dropped wrapped line used to take
+        # the rest of the paragraph with it), fall back to the mild echo-only pass
+        if len(raw) >= 200 and len(content) < 0.4 * len(raw):
+            log.warning(
+                "clean_minutes removed %d of %d chars — falling back to mild cleanup",
+                len(raw) - len(content), len(raw),
+            )
+            content = _strip_instruction_echoes(raw)
         if len(content) < 20:
             # keep the previous minutes rather than replacing them with nothing
             raise RuntimeError(

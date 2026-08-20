@@ -161,9 +161,63 @@ def chat_stream(
         ) from exc
 
 
-def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -> tuple[bool, str]:
+def list_models(base_url: str, api_key: str = "", timeout: float = 8.0) -> tuple[list[str], str]:
+    """Model names a provider offers, as (models, error_detail).
+
+    Tries the OpenAI-standard `GET /v1/models` first — Groq, OpenAI, llama.cpp,
+    vLLM and Ollama's compat layer all implement it — then falls back to Ollama's
+    native `/api/tags` for older servers. Powers the model dropdown in Settings,
+    so people pick from a list instead of typing an exact id from memory."""
+    base = (base_url or "").strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        return [], "Enter the base URL first (http:// or https://, with the port if any)"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    limits = httpx.Timeout(timeout, connect=5.0)
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    attempts = [(f"{base}/models", "openai"), (f"{root}/api/tags", "ollama")]
+    detail = ""
+    for url, shape in attempts:
+        try:
+            resp = httpx.get(url, headers=headers, timeout=limits)
+            resp.raise_for_status()
+            payload = resp.json()
+            if shape == "openai":
+                names = [m["id"] for m in payload.get("data", []) if m.get("id")]
+            else:
+                names = [m["name"] for m in payload.get("models", []) if m.get("name")]
+            if names:
+                # embedding-only models can't chat — offering them just invites a
+                # failed summary later
+                return sorted(n for n in names if "embed" not in n.lower()), ""
+            detail = "The server returned an empty model list"
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            detail = (
+                f"The API key was rejected (HTTP {code})"
+                if code in (401, 403)
+                else f"Server replied with HTTP {code}"
+            )
+            if code in (401, 403):
+                break  # a bad key won't work on the fallback either
+        except httpx.ConnectError:
+            detail = "Could not reach that URL — check the address, port and that it's running"
+            break
+        except httpx.TimeoutException:
+            detail = f"No reply within {timeout:.0f}s — server busy or a firewall in between"
+            break
+        except Exception as exc:
+            detail = f"Unexpected error: {exc.__class__.__name__}"
+    return [], detail or "This server doesn't publish a model list — type the model name"
+
+
+def probe(base_url: str, model: str, api_key: str = "", timeout: float = 45.0) -> tuple[bool, str]:
     """Test a provider config WITHOUT saving it: one tiny chat call. Returns
-    (ok, human-readable detail) — powers the Settings 'Test connection' button."""
+    (ok, human-readable detail) — powers the Settings 'Test connection' button.
+
+    The read timeout is generous on purpose: a 20-30B model cold-loading into a
+    GPU server can take ~30s for its FIRST reply, and the old 10s limit reported
+    a perfectly good server as unreachable. Connection failures still surface in
+    seconds via the separate connect timeout."""
     base = (base_url or "").strip().rstrip("/")
     if not base.startswith(("http://", "https://")):
         return False, "Base URL must start with http:// or https:// (include the port if any)"
@@ -171,9 +225,25 @@ def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -
         return False, "Enter a model name"
     messages = [{"role": "user", "content": "Reply with exactly: OK"}]
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    limits = httpx.Timeout(timeout, connect=5.0)
     try:
         if _is_ollama(base):
             root = base[: -len("/v1")] if base.endswith("/v1") else base
+            # quick pre-check: Ollama-family servers list their models, which gives a
+            # far better message than a bare 404 from the chat endpoint
+            try:
+                tags = httpx.get(f"{root}/api/tags", timeout=4.0)
+                tags.raise_for_status()
+                installed = [m["name"] for m in tags.json().get("models", [])]
+                if installed and model not in installed:
+                    have = ", ".join(installed[:8])
+                    more = "…" if len(installed) > 8 else ""
+                    return False, (
+                        f"Server reached, but it doesn't have '{model}'. "
+                        f"Available: {have}{more}"
+                    )
+            except httpx.HTTPError:
+                pass  # proxied/older servers may hide /api/tags — let the chat call decide
             resp = httpx.post(
                 f"{root}/api/chat",
                 json={
@@ -182,7 +252,7 @@ def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -
                     "stream": False,
                     "options": {"num_predict": 8},
                 },
-                timeout=timeout,
+                timeout=limits,
             )
             resp.raise_for_status()
             reply = resp.json()["message"]["content"]
@@ -191,7 +261,7 @@ def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -
                 f"{base}/chat/completions",
                 json={"model": model, "messages": messages, "max_tokens": 8},
                 headers=headers,
-                timeout=timeout,
+                timeout=limits,
             )
             resp.raise_for_status()
             reply = resp.json()["choices"][0]["message"]["content"]
@@ -211,10 +281,15 @@ def probe(base_url: str, model: str, api_key: str = "", timeout: float = 10.0) -
             "Could not reach that URL — check the address and port, and that the "
             "server is running"
         )
+    except httpx.ConnectTimeout:
+        return False, (
+            "Could not reach that URL (connect timed out) — check the address and "
+            "port, and that a firewall isn't blocking it"
+        )
     except httpx.TimeoutException:
         return False, (
-            f"No reply within {timeout:.0f}s — server busy, wrong port, or a "
-            "firewall in between"
+            f"Server reached, but no reply within {timeout:.0f}s — a large model "
+            "may still be loading into memory; wait a minute and test again"
         )
     except Exception as exc:
         return False, f"{exc.__class__.__name__}: {exc}"

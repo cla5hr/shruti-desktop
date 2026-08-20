@@ -178,7 +178,7 @@ def fake_diarize(monkeypatch, fixtures_dir):
     class FakeBackend:
         name = "fake"
 
-        def diarize(self, wav_path, settings):
+        def diarize(self, wav_path, settings, num_speakers=0):
             return turns
 
     monkeypatch.setitem(DIARIZE_BACKENDS, "fake", FakeBackend())
@@ -266,3 +266,102 @@ def test_meeting_stays_processing_until_diarize(db, tmp_storage, fake_asr, fake_
     run_until_idle(["gpu"])
     db.refresh(meeting)
     assert meeting.status == "ready"
+
+
+def test_stale_diarize_retargets_active_transcript(db, tmp_storage, fake_asr, fake_diarize):
+    """A diarize job enqueued for an OLD transcript version must rebuild the ACTIVE
+    one. The stale job used to null speaker_id across every version, then rebuild
+    only its old target — leaving the meeting with speakers that own 0 segments."""
+    from shruti_core.models import Transcript
+
+    meeting, rec = make_meeting_with_upload(db, make_wav_bytes(1.0))
+    jobs.enqueue(
+        db, "extract_audio", queue="io", meeting_id=meeting.id,
+        payload={"recording_id": str(rec.id)},
+    )
+    run_until_idle(["io", "gpu"])
+    old = db.scalars(
+        select(Transcript).where(Transcript.meeting_id == meeting.id, Transcript.is_active)
+    ).one()
+
+    # simulate a retranscribe: a second asr run creates a NEW active transcript
+    # (its chained diarize runs too — that's fine, it targets the new version)
+    jobs.enqueue(
+        db, "asr", queue="gpu", meeting_id=meeting.id, payload={"recording_id": str(rec.id)}
+    )
+    run_until_idle(["gpu", "io"])
+    new = db.scalars(
+        select(Transcript).where(Transcript.meeting_id == meeting.id, Transcript.is_active)
+    ).one()
+    assert new.id != old.id
+
+    # now the stale job fires (e.g. re-detect clicked mid-retranscribe)
+    jobs.enqueue(
+        db, "diarize", queue="gpu", meeting_id=meeting.id,
+        payload={"recording_id": str(rec.id), "transcript_id": str(old.id)},
+    )
+    run_until_idle(["gpu"])
+
+    active_segments = db.scalars(
+        select(TranscriptSegment).where(TranscriptSegment.transcript_id == new.id)
+    ).all()
+    assert active_segments, "active transcript lost its segments"
+    assert all(s.speaker_id is not None for s in active_segments), (
+        "stale diarize job wiped the active transcript's speaker assignments"
+    )
+
+
+def test_diarize_num_speakers_payload_overrides_settings(
+    db, tmp_storage, fake_asr, monkeypatch
+):
+    from shruti_core.models import Transcript
+
+    seen: list[int] = []
+
+    class CaptureBackend:
+        name = "capture"
+
+        def diarize(self, wav_path, settings, num_speakers=0):
+            seen.append(num_speakers)
+            return [T(0, 1000, "SPEAKER_00")]
+
+    monkeypatch.setitem(DIARIZE_BACKENDS, "capture", CaptureBackend())
+    monkeypatch.setenv("DIARIZE_BACKEND", "capture")
+    monkeypatch.setenv("DIARIZE_ENABLED", "1")
+    monkeypatch.setenv("DIARIZE_NUM_SPEAKERS", "7")
+    get_settings.cache_clear()
+    try:
+        meeting, rec = make_meeting_with_upload(db, make_wav_bytes(1.0))
+        jobs.enqueue(
+            db, "extract_audio", queue="io", meeting_id=meeting.id,
+            payload={"recording_id": str(rec.id)},
+        )
+        run_until_idle(["io", "gpu"])
+        assert seen[-1] == 7  # no payload override -> Settings value
+
+        tid = db.scalars(
+            select(Transcript.id).where(
+                Transcript.meeting_id == meeting.id, Transcript.is_active
+            )
+        ).one()
+        jobs.enqueue(
+            db, "diarize", queue="gpu", meeting_id=meeting.id,
+            payload={
+                "recording_id": str(rec.id),
+                "transcript_id": str(tid),
+                "num_speakers": 2,
+            },
+        )
+        run_until_idle(["gpu"])
+        assert seen[-1] == 2  # per-run request (Speakers panel) wins
+    finally:
+        get_settings.cache_clear()
+
+
+def test_renumber_labels_after_junk_drop():
+    from shruti_worker.pipeline.diarize import renumber_labels
+
+    turns = [T(0, 1000, "SPEAKER_04"), T(1000, 2000, "SPEAKER_01"), T(2000, 3000, "SPEAKER_04")]
+    out = renumber_labels(turns)
+    assert [t.label for t in out] == ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00"]
+    assert [(t.start_ms, t.end_ms) for t in out] == [(0, 1000), (1000, 2000), (2000, 3000)]

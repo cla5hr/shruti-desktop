@@ -198,9 +198,22 @@ def main() -> int:
     )
     log = logging.getLogger("shruti.desktop")
 
+    # Windows proactor logs a full ERROR traceback every time a browser tab drops
+    # its connection (WinError 10054) — pure noise that makes the log look broken
+    class _MuteClientDisconnects(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "ConnectionResetError" not in record.getMessage() and (
+                record.exc_info is None
+                or not isinstance(record.exc_info[1], ConnectionResetError)
+            )
+
+    logging.getLogger("asyncio").addFilter(_MuteClientDisconnects())
+
     if _shruti_already_running(PREFERRED_PORT):  # second launch = just open the window
         webbrowser.open(f"http://127.0.0.1:{PREFERRED_PORT}")
-        return 0
+        # hard exit: a plain return sometimes left this process alive in the frozen
+        # exe (observed: a "second launch" from 13:26 still running an hour later)
+        os._exit(0)
 
     configure_env(data)
 

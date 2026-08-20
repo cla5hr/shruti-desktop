@@ -29,6 +29,15 @@ class MediaError(RuntimeError):
     pass
 
 
+# ffmpeg messages that mean the INPUT FILE itself is unreadable — retrying can
+# never fix these, so the job fails immediately (a text file renamed .mp3 used to
+# sit in QUEUED for ~15 minutes of backoff before the user saw anything)
+_PERMANENT_FFMPEG_ERRORS = (
+    "Invalid data found when processing input",
+    "Error opening input",
+)
+
+
 def _run(cmd: list[str]) -> None:
     proc = subprocess.run(
         cmd,
@@ -40,7 +49,12 @@ def _run(cmd: list[str]) -> None:
     )
     if proc.returncode != 0:
         tail = (proc.stderr or "")[-2000:]
-        raise MediaError(f"{cmd[0]} failed (rc={proc.returncode}):\n{tail}")
+        msg = f"{cmd[0]} failed (rc={proc.returncode}):\n{tail}"
+        if any(marker in tail for marker in _PERMANENT_FFMPEG_ERRORS):
+            raise jobs.PermanentJobError(
+                f"this file isn't valid audio/video (ffmpeg can't read it)\n{msg}"
+            )
+        raise MediaError(msg)
 
 
 def probe_duration_s(path: str) -> float:

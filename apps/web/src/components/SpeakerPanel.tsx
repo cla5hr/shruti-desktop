@@ -93,8 +93,16 @@ function SpeakerRow({ meetingId, speaker, speakers, colorOf, onPlaySample }: Pro
 export default function SpeakerPanel(props: Props) {
   const queryClient = useQueryClient();
   const [confirm, setConfirm] = useState(false);
+  // per-meeting head-count for THIS re-run (empty = auto) — fixing one meeting's
+  // split shouldn't require a trip to app-wide Settings
+  const [people, setPeople] = useState("");
   const redetect = useMutation({
-    mutationFn: () => api.rediarize(props.meetingId),
+    mutationFn: () => {
+      // empty field = use the Settings default; an explicit number (including 0
+      // for "auto-detect") overrides Settings for this run only
+      const n = Number.parseInt(people, 10);
+      return api.rediarize(props.meetingId, Number.isFinite(n) && n >= 0 ? n : undefined);
+    },
     onSuccess: () => {
       setConfirm(false);
       queryClient.invalidateQueries({ queryKey: ["meeting", props.meetingId] });
@@ -110,6 +118,19 @@ export default function SpeakerPanel(props: Props) {
         props.speakers.map((s) => <SpeakerRow key={s.id} {...props} speaker={s} />)
       )}
       <div className="speakers__foot">
+        <label className="speakers__people">
+          People:
+          <input
+            className="speakers__name speakers__people-input"
+            type="number"
+            min={0}
+            max={30}
+            placeholder="auto"
+            value={people}
+            onChange={(e) => setPeople(e.target.value)}
+            aria-label="How many people were in this meeting (empty = detect automatically)"
+          />
+        </label>
         {confirm ? (
           <button
             className="speakers__btn speakers__btn--go"
@@ -124,8 +145,8 @@ export default function SpeakerPanel(props: Props) {
           </button>
         )}
         <span className="speakers__hint">
-          Wrong split? Set "people in the meeting" in ⚙ Settings, then re-detect. Renames
-          apply to the transcript instantly — hit Regenerate in Minutes to update names there.
+          Wrong split? Type the real head-count in "People" and re-detect. Renames apply to
+          the transcript instantly — hit Regenerate in Minutes to update names there.
         </span>
       </div>
     </div>

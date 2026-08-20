@@ -1,5 +1,7 @@
 import re
+import shutil
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -71,10 +73,17 @@ def delete_meeting(meeting_id: uuid.UUID, db: Db) -> None:
     chat, jobs, bot session, and all stored audio/waveform files."""
     meeting = _get_meeting(db, meeting_id)
 
-    # storage: remove every file under this meeting's prefix
+    # storage: remove every file under this meeting's prefix, then the now-empty
+    # folder itself (deleted meetings used to leave husk directories behind)
     storage = get_storage()
     for key in list(storage.iter_keys(str(meeting_id))):
         storage.delete(key)
+    try:
+        folder = storage.path(str(meeting_id))
+        if folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
+    except ValueError:
+        pass
 
     # DB: delete children before parents (no ON DELETE CASCADE in the schema)
     transcript_ids = db.scalars(
@@ -197,6 +206,19 @@ def retranscribe(meeting_id: uuid.UUID, db: Db) -> dict:
         raise HTTPException(status_code=409, detail="no processed recording to retranscribe")
     if existing := _job_in_flight(db, meeting.id, "asr"):
         return job_public(existing)
+    # a fresh run supersedes any diarize/summarize still pending for the OLD
+    # transcript — cancel them so they don't burn minutes of compute on stale work
+    # (running ones notice at their next progress checkpoint)
+    for stale in db.scalars(
+        select(Job).where(
+            Job.meeting_id == meeting.id,
+            Job.type.in_(("diarize", "summarize")),
+            Job.status.in_(("queued", "running")),
+        )
+    ):
+        stale.status = "cancelled"
+        stale.finished_at = datetime.now(UTC)
+        stale.error = None
     meeting.status = "processing"
     db.commit()
     job = jobs.enqueue(
@@ -211,8 +233,16 @@ def retranscribe(meeting_id: uuid.UUID, db: Db) -> dict:
     return job_public(job)
 
 
+class RediarizeBody(BaseModel):
+    """Optional head-count for THIS re-run (0 = auto-detect). Overrides the global
+    Settings value, so fixing one meeting's speaker split doesn't require editing
+    app-wide settings first."""
+
+    num_speakers: int | None = Field(default=None, ge=0, le=30)
+
+
 @router.post("/meetings/{meeting_id}/rediarize", status_code=202)
-def rediarize(meeting_id: uuid.UUID, db: Db) -> dict:
+def rediarize(meeting_id: uuid.UUID, db: Db, body: RediarizeBody | None = None) -> dict:
     """Re-run speaker separation on the existing transcript (no re-transcription) —
     used after changing the people-count setting or when the auto-detect got it wrong."""
     meeting = _get_meeting(db, meeting_id)
@@ -224,12 +254,15 @@ def rediarize(meeting_id: uuid.UUID, db: Db) -> dict:
         return job_public(existing)
     meeting.status = "processing"
     db.commit()
+    payload = {"recording_id": str(rec.id), "transcript_id": str(transcript.id)}
+    if body is not None and body.num_speakers is not None:
+        payload["num_speakers"] = body.num_speakers
     job = jobs.enqueue(
         db,
         "diarize",
         queue="gpu",
         meeting_id=meeting.id,
-        payload={"recording_id": str(rec.id), "transcript_id": str(transcript.id)},
+        payload=payload,
         # no dedupe: an explicit re-run is always a fresh attempt
     )
     assert job is not None
@@ -245,7 +278,10 @@ def export_markdown(meeting_id: uuid.UUID, db: Db) -> PlainTextResponse:
 
     lines = [f"# {meeting.title or 'Untitled meeting'}", ""]
     if meeting.created_at:
-        lines.append(f"- **Date:** {meeting.created_at.strftime('%d %b %Y, %H:%M')}")
+        # stored as naive UTC; the desktop exe runs on the user's own machine, so
+        # the local timezone here IS the user's timezone
+        stamp = meeting.created_at.replace(tzinfo=UTC).astimezone()
+        lines.append(f"- **Date:** {stamp.strftime('%d %b %Y, %H:%M')}")
     if meeting.duration_s:
         lines.append(f"- **Duration:** {_clock(meeting.duration_s * 1000)}")
     speaker_list = sorted(
