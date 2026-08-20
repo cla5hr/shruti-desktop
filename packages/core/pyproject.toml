@@ -1,0 +1,18 @@
+[project]
+name = "shruti-core"
+version = "0.1.0"
+description = "Shared core for Shruti: settings, DB models, job queue, storage"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0.36",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shruti_core"]

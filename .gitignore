@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+apps/web/dist/
+apps/web/test-results/
+apps/web/playwright-report/
+
+# Env & secrets — NEVER commit real env files
+.env
+.env.*
+
+# Data & models (local runtime artifacts)
+data/
+*.log
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local working notes (not part of the repo)
+CLAUDE.md
+
+# desktop exe build
+desktop/.venv-desktop/
+desktop/dist/
+desktop/buildwork/
+desktop/ffmpeg/
+release/

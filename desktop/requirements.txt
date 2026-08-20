@@ -1,0 +1,8 @@
+# Desktop exe build environment (separate from the dev .venv).
+# The shruti packages themselves are installed editable by build.ps1.
+faster-whisper>=1.1
+sherpa-onnx>=1.12
+numpy>=1.26
+pystray>=0.19.5
+pillow>=10
+pyinstaller>=6.11

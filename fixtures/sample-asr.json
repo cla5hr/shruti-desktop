@@ -1,0 +1,32 @@
+{
+  "language": "en",
+  "segments": [
+    {
+      "start_ms": 0,
+      "end_ms": 3200,
+      "text": "Good morning everyone, let us start the meeting.",
+      "words": [
+        { "word": "Good", "start_ms": 0, "end_ms": 350 },
+        { "word": "morning", "start_ms": 350, "end_ms": 800 },
+        { "word": "everyone,", "start_ms": 800, "end_ms": 1400 },
+        { "word": "let", "start_ms": 1600, "end_ms": 1800 },
+        { "word": "us", "start_ms": 1800, "end_ms": 1950 },
+        { "word": "start", "start_ms": 1950, "end_ms": 2300 },
+        { "word": "the", "start_ms": 2300, "end_ms": 2450 },
+        { "word": "meeting.", "start_ms": 2450, "end_ms": 3200 }
+      ]
+    },
+    {
+      "start_ms": 4000,
+      "end_ms": 8500,
+      "text": "The propulsion test on Thursday was successful.",
+      "words": []
+    },
+    {
+      "start_ms": 9000,
+      "end_ms": 14000,
+      "text": "We need one more week of bench testing before sign off.",
+      "words": []
+    }
+  ]
+}
