@@ -1,5 +1,3 @@
-<p align="center"><img src="apps/web/public/skyroot_logo.png" alt="Skyroot" height="80"></p>
-
 # Shruti — Private AI Meeting Notes
 
 *श्रुति — "that which is heard."*
@@ -91,10 +89,3 @@ apps/web        React UI
 packages/core   settings, database models, job queue, storage, LLM client
 desktop/        exe entry point + build
 ```
-
-A hosted multi-user variant (Postgres, GPU, a Teams bot that joins meetings)
-lives in the original internal repo — this repo is the desktop app only.
-
----
-
-*Internal Skyroot Aerospace project · Sashank T · built with Claude Code.*
