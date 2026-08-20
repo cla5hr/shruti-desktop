@@ -52,6 +52,12 @@ ASR_CHOICES = [
 
 _INT_KEYS = {"llm_max_ctx", "diarize_num_speakers"}
 
+# "Ollama on this computer" means exactly that — this address, never whatever URL
+# happens to be saved. (It used to probe settings.llm_base_url, so a user pointed
+# at the company GPU server saw ITS 14 models under "on this computer" while their
+# own installed model was missing from the list.)
+LOCAL_OLLAMA = "http://localhost:11434/v1"
+
 
 def _is_ollama(base_url: str) -> bool:
     return ":11434" in base_url
@@ -118,7 +124,7 @@ def _current_values() -> dict:
 
 def _public() -> dict:
     s = get_settings()
-    ollama_models = _ollama_models(s.llm_base_url) if _is_ollama(s.llm_base_url) else None
+    ollama_models = _ollama_models(LOCAL_OLLAMA)
     # embedding-only models can't chat — offering them in the minutes picker just
     # sets people up for a failed summary (validation still accepts them if typed)
     pickable = [m for m in (ollama_models or []) if "embed" not in m.lower()]

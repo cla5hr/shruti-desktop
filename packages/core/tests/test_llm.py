@@ -73,3 +73,69 @@ def test_openai_transport_for_non_ollama(monkeypatch, capture_post):
     assert call["json"]["max_tokens"] == 99
     assert "options" not in call["json"]
     get_settings.cache_clear()
+
+
+def test_ollama_requests_disable_reasoning(monkeypatch):
+    """Reasoning models must not spend the answer budget on their monologue."""
+    import httpx
+
+    import shruti_core.llm as llm
+
+    sent = {}
+
+    def fake_post(url, json=None, **kw):
+        sent.update({"url": url, "body": json})
+        return httpx.Response(
+            200,
+            json={"message": {"role": "assistant", "content": "## Summary\n\nfine"}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setenv("LLM_MODE", "live")
+    monkeypatch.setenv("LLM_BASE_URL", "http://192.168.10.81:11434/v1")
+    monkeypatch.setenv("LLM_MODEL", "qwen3.8:27b")
+    get_settings.cache_clear()
+    try:
+        out = llm.chat([{"role": "user", "content": "hi"}])
+    finally:
+        get_settings.cache_clear()
+    assert out == "## Summary\n\nfine"
+    assert sent["url"].endswith("/api/chat")
+    assert sent["body"]["think"] is False
+
+
+def test_empty_answer_after_reasoning_raises_a_clear_error(monkeypatch):
+    import httpx
+
+    import shruti_core.llm as llm
+
+    def fake_post(url, json=None, **kw):
+        return httpx.Response(
+            200,
+            json={
+                "message": {"role": "assistant", "content": "", "thinking": "a" * 1750},
+                "done_reason": "length",
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setenv("LLM_MODE", "live")
+    monkeypatch.setenv("LLM_BASE_URL", "http://192.168.10.81:11434/v1")
+    monkeypatch.setenv("LLM_MODEL", "qwen3.8:27b")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(llm.LLMError, match="internal reasoning"):
+            llm.chat([{"role": "user", "content": "hi"}])
+    finally:
+        get_settings.cache_clear()
+
+
+def test_strip_reasoning_handles_inline_and_truncated_blocks():
+    from shruti_core.llm import strip_reasoning
+
+    assert strip_reasoning("<think>hmm</think>## Summary") == "## Summary"
+    assert strip_reasoning("## Summary\n\nreal text") == "## Summary\n\nreal text"
+    # budget ran out mid-thought: no closing tag, nothing usable after it
+    assert strip_reasoning("## Summary\n<think>still thinking and cut off") == "## Summary"

@@ -56,3 +56,31 @@ def test_list_models_drops_embedding_models(monkeypatch):
     models, detail = llm.list_models("http://192.168.10.81:11434/v1")
     assert models == ["qwen3.8:27b"]
     assert detail == ""
+
+
+def test_local_ollama_list_ignores_a_remote_saved_url(monkeypatch):
+    """"Ollama on this computer" must describe THIS machine, even when the saved
+    provider is a remote Ollama server (that used to leak the company server's
+    models into the local picker)."""
+    from shruti_api.routers import app_settings as mod
+
+    asked: list[str] = []
+
+    def fake_models(base_url, timeout=0.5, use_cache=True):
+        asked.append(base_url)
+        return ["qwen2.5:3b"]
+
+    monkeypatch.setattr(mod, "_ollama_models", fake_models)
+    monkeypatch.setenv("LLM_MODE", "live")
+    monkeypatch.setenv("LLM_BASE_URL", "http://192.168.10.81:11434/v1")  # remote
+    monkeypatch.setenv("LLM_MODEL", "qwen3.8:27b")
+    from shruti_core.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        resp = TestClient(app).get("/api/settings")
+        assert resp.status_code == 200
+        assert resp.json()["meta"]["ollama"]["models"] == ["qwen2.5:3b"]
+        assert asked == [mod.LOCAL_OLLAMA]
+    finally:
+        get_settings.cache_clear()

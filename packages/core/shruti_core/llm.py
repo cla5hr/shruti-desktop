@@ -7,6 +7,8 @@
             context at launch, so no per-request ctx needed)
 """
 
+import re
+
 import httpx
 
 from shruti_core.settings import get_settings
@@ -14,6 +16,42 @@ from shruti_core.settings import get_settings
 
 class LLMError(RuntimeError):
     pass
+
+
+# Reasoning models (qwen3.x, deepseek-r1, gpt-oss…) spend tokens on an internal
+# monologue before answering, and that monologue counts against the SAME output
+# budget as the answer. Measured on qwen3.8:27b: 1750 characters of thinking, then
+# an empty answer — which surfaced as "the model returned empty/unusable minutes"
+# and a job that retried on a 30s/60s/120s backoff. Ollama-family servers accept
+# `think: false` (verified harmless on non-reasoning models too), so ask for the
+# answer only.
+_THINK_OFF = False
+
+_THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = re.compile(r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop <think> blocks some servers inline into the content (including an
+    unterminated one left behind when the budget ran out mid-thought)."""
+    out = _THINK_BLOCK.sub("", text or "")
+    out = _THINK_OPEN.sub("", out)
+    return out.strip()
+
+
+def _ollama_content(data: dict) -> str:
+    """Answer text from an Ollama /api/chat reply, with a clear error when the
+    model burned its whole budget without producing one."""
+    content = strip_reasoning(data.get("message", {}).get("content", ""))
+    if not content:
+        thought = (data.get("message", {}) or {}).get("thinking") or ""
+        if data.get("done_reason") == "length" or thought:
+            raise LLMError(
+                "the model spent its entire output budget on internal reasoning and "
+                "returned no answer — try a non-reasoning model (e.g. gemma4:26b) or "
+                "a shorter meeting"
+            )
+    return content
 
 
 def estimate_tokens(text: str) -> int:
@@ -51,6 +89,7 @@ def chat(
                     "model": settings.llm_model,
                     "messages": messages,
                     "stream": False,
+                    "think": _THINK_OFF,
                     "options": {
                         "num_ctx": settings.llm_max_ctx,
                         "temperature": temperature,
@@ -60,7 +99,7 @@ def chat(
                 timeout=timeout,
             )
             resp.raise_for_status()
-            return resp.json()["message"]["content"]
+            return _ollama_content(resp.json())
 
         resp = httpx.post(
             f"{base}/chat/completions",
@@ -110,6 +149,9 @@ def chat_stream(
                     "model": settings.llm_model,
                     "messages": messages,
                     "stream": True,
+                    # without this, an Ask answer waits behind the model's whole
+                    # reasoning pass (and can arrive empty) — see _THINK_OFF
+                    "think": _THINK_OFF,
                     "options": {
                         "num_ctx": settings.llm_max_ctx,
                         "temperature": temperature,
@@ -250,12 +292,13 @@ def probe(base_url: str, model: str, api_key: str = "", timeout: float = 45.0) -
                     "model": model,
                     "messages": messages,
                     "stream": False,
+                    "think": _THINK_OFF,  # a reasoning pass would blow the 8-token budget
                     "options": {"num_predict": 8},
                 },
                 timeout=limits,
             )
             resp.raise_for_status()
-            reply = resp.json()["message"]["content"]
+            reply = strip_reasoning(resp.json().get("message", {}).get("content", ""))
         else:
             resp = httpx.post(
                 f"{base}/chat/completions",
